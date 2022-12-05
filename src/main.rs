@@ -8,14 +8,35 @@ use object::elf;
 use object::read::elf::{Dyn, FileHeader, ProgramHeader, Rel, Rela, SectionHeader, Sym};
 use object::Endianness;
 
+use std::collections::HashMap;
+use std::ffi::CStr;
+use std::fs::File;
+use std::io::{self, BufRead};
+
 fn main() {
     let mut args = env::args();
-    if args.len() != 3 {
-        eprintln!("Usage: {} <infile> <outfile>", args.next().unwrap());
+    if !(args.len() == 3 || args.len() == 5) {
+        eprintln!(
+            "Usage: {} [--redefine-syms <file>] <infile> <outfile>",
+            args.next().unwrap()
+        );
         process::exit(1);
     }
 
     args.next();
+
+    let redefine_file = match args.len() {
+        // 4 tokens remaining means we have specified --redefine-syms <file>
+        4 => {
+            if args.next() != Some("--redefine-syms".to_string()) {
+                eprintln!("Usage: [--redefine-syms <file>] <infile> <outfile>");
+                process::exit(1);
+            }
+            Some(args.next().unwrap())
+        }
+        _ => None,
+    };
+
     let in_file_path = args.next().unwrap();
     let out_file_path = args.next().unwrap();
 
@@ -43,8 +64,12 @@ fn main() {
         }
     };
     let out_data = match kind {
-        object::FileKind::Elf32 => copy_file::<elf::FileHeader32<Endianness>>(in_data).unwrap(),
-        object::FileKind::Elf64 => copy_file::<elf::FileHeader64<Endianness>>(in_data).unwrap(),
+        object::FileKind::Elf32 => {
+            copy_file::<elf::FileHeader32<Endianness>>(in_data, redefine_file).unwrap()
+        }
+        object::FileKind::Elf64 => {
+            copy_file::<elf::FileHeader64<Endianness>>(in_data, redefine_file).unwrap()
+        }
         _ => {
             eprintln!("Not an ELF file");
             process::exit(1);
@@ -82,8 +107,61 @@ struct DynamicSymbol {
     gnu_hash: Option<u32>,
 }
 
+/// Table that holds a map of the symbols we should rename while copying
+///
+/// This will be loaded by passing a file with lines of the form:
+/// ```
+/// <original_sym> <new_sym>
+/// ```
+/// A symbol name can then be passed to query the corresponding new
+/// name that we should provide the `out_*` variables in `copy_file`.
+struct RedefineSymTable {
+    map: HashMap<String, String>,
+}
+
+impl RedefineSymTable {
+    fn new(filename: String) -> Result<Self, Box<dyn Error>> {
+        let file = File::open(filename)?;
+
+        let mut ret = Self {
+            map: HashMap::new(),
+        };
+
+        for res in io::BufReader::new(file).lines() {
+            let line = res?;
+            let names: Vec<&str> = line.split(' ').take(2).collect();
+
+            // check that there are two symbol names on each line
+            if names.len() != 2 {
+                return Err(
+                    "Error: invalid redefine file. --redefine-syms expects lines \
+                    of the form: <original_sym> <new_sym>"
+                        .into(),
+                );
+            }
+
+            ret.map.insert(names[0].to_string(), names[1].to_string());
+        }
+
+        return Ok(ret);
+    }
+
+    fn get_redefined_name<'a>(
+        &'a self,
+        original_slice: &'a [u8],
+    ) -> Result<&'a [u8], Box<dyn Error>> {
+        let original = std::str::from_utf8(original_slice)?;
+
+        match self.map.get(original) {
+            Some(new_string) => Ok(new_string.as_bytes()),
+            None => Ok(original_slice),
+        }
+    }
+}
+
 fn copy_file<Elf: FileHeader<Endian = Endianness>>(
     in_data: &[u8],
+    redefine_file: Option<String>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let in_elf = Elf::parse(in_data)?;
     let endian = in_elf.endian()?;
@@ -92,6 +170,17 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
     let in_sections = in_elf.sections(endian, in_data)?;
     let in_syms = in_sections.symbols(endian, in_data, elf::SHT_SYMTAB)?;
     let in_dynsyms = in_sections.symbols(endian, in_data, elf::SHT_DYNSYM)?;
+
+    let redefine_table = match redefine_file {
+        Some(file) => Some(RedefineSymTable::new(file)?),
+        None => None,
+    };
+    let redefine_symbol_name = |raw_symbol_name| -> Result<&[u8], Box<dyn Error>> {
+        match redefine_table.as_ref() {
+            Some(table) => Ok(table.get_redefined_name(raw_symbol_name)?),
+            None => Ok(raw_symbol_name),
+        }
+    };
 
     let mut out_data = Vec::new();
     let mut writer = object::write::elf::Writer::new(endian, in_elf.is_class_64(), &mut out_data);
@@ -207,7 +296,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
                 let s = in_dynamic_strings
                     .get(val.try_into()?)
                     .map_err(|_| "Invalid dynamic string")?;
-                Some(writer.add_dynamic_string(s))
+                Some(writer.add_dynamic_string(redefine_symbol_name(s)?))
             } else {
                 None
             };
@@ -236,7 +325,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
         let mut gnu_hash = None;
         if in_dynsym.st_name(endian) != 0 {
             let in_name = in_dynsyms.symbol_name(endian, in_dynsym)?;
-            name = Some(writer.add_dynamic_string(in_name));
+            name = Some(writer.add_dynamic_string(redefine_symbol_name(in_name)?));
             if !in_name.is_empty() {
                 hash = Some(elf::hash(in_name));
                 if !in_dynsym.is_undefined(endian) {
@@ -303,7 +392,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
         };
         out_syms_index.push(writer.reserve_symbol_index(section));
         let name = if in_sym.st_name(endian) != 0 {
-            Some(writer.add_string(in_syms.symbol_name(endian, in_sym)?))
+            Some(writer.add_string(redefine_symbol_name(in_syms.symbol_name(endian, in_sym)?)?))
         } else {
             None
         };
@@ -326,7 +415,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
             assert!(verdef.vd_cnt.get(endian) > 0);
             verdef_count += 1;
             while let Some(verdaux) = verdauxs.next()? {
-                writer.add_dynamic_string(verdaux.name(endian, strings)?);
+                writer.add_dynamic_string(redefine_symbol_name(verdaux.name(endian, strings)?)?);
                 verdaux_count += 1;
             }
         }
@@ -337,10 +426,10 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
     if let Some((mut verneeds, link)) = in_verneed.clone() {
         let strings = in_sections.strings(endian, in_data, link)?;
         while let Some((verneed, mut vernauxs)) = verneeds.next()? {
-            writer.add_dynamic_string(verneed.file(endian, strings)?);
+            writer.add_dynamic_string(redefine_symbol_name(verneed.file(endian, strings)?)?);
             verneed_count += 1;
             while let Some(vernaux) = vernauxs.next()? {
-                writer.add_dynamic_string(vernaux.name(endian, strings)?);
+                writer.add_dynamic_string(redefine_symbol_name(vernaux.name(endian, strings)?)?);
                 vernaux_count += 1;
             }
         }
