@@ -9,7 +9,6 @@ use object::read::elf::{Dyn, FileHeader, ProgramHeader, Rel, Rela, SectionHeader
 use object::Endianness;
 
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, BufRead};
 
