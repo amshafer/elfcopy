@@ -8,3 +8,7 @@ edition = "2018"
 [dependencies]
 object={version="0.30.0", features=["write"]}
 memmap2="0.5.8"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]
