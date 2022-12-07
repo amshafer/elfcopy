@@ -324,11 +324,12 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
         let mut gnu_hash = None;
         if in_dynsym.st_name(endian) != 0 {
             let in_name = in_dynsyms.symbol_name(endian, in_dynsym)?;
-            name = Some(writer.add_dynamic_string(redefine_symbol_name(in_name)?));
-            if !in_name.is_empty() {
-                hash = Some(elf::hash(in_name));
+            let redefined_name = redefine_symbol_name(in_name)?;
+            name = Some(writer.add_dynamic_string(redefined_name));
+            if !redefined_name.is_empty() {
+                hash = Some(elf::hash(redefined_name));
                 if !in_dynsym.is_undefined(endian) {
-                    gnu_hash = Some(elf::gnu_hash(in_name));
+                    gnu_hash = Some(elf::gnu_hash(redefined_name));
                 }
             }
         };
