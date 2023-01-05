@@ -191,6 +191,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
     let mut in_versym = None;
     let mut in_verdef = None;
     let mut in_verneed = None;
+    let mut in_attrib = None;
     let mut out_sections = Vec::with_capacity(in_sections.len());
     let mut out_sections_index = Vec::with_capacity(in_sections.len());
     for (i, in_section) in in_sections.iter().enumerate() {
@@ -274,6 +275,11 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
                 in_verneed = in_section.gnu_verneed(endian, in_data)?;
                 debug_assert!(in_verneed.is_some());
                 index = writer.reserve_gnu_verneed_section_index();
+            }
+            elf::SHT_GNU_ATTRIBUTES => {
+                in_attrib = in_section.gnu_attributes(endian, in_data)?;
+                debug_assert!(in_attrib.is_some());
+                index = writer.reserve_gnu_attributes_section_index();
             }
             other => {
                 panic!("Unsupported section type {:x}", other);
@@ -435,6 +441,14 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
         }
     }
 
+    // Add one byte for the version field at the start of the section
+    let mut gnu_attributes_size = 1;
+    if let Some((_version, mut vsections, _link)) = in_attrib.clone() {
+        while let Some((section_length, _vendor_name, _tags)) = vsections.next()? {
+            gnu_attributes_size += section_length.get(endian) as usize;
+        }
+    }
+
     // Start reserving file ranges.
     writer.reserve_file_header();
 
@@ -446,6 +460,7 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
     let mut dynamic_addr = 0;
     let mut dynsym_addr = 0;
     let mut dynstr_addr = 0;
+    let mut attributes_addr = 0;
 
     let mut alloc_sections = Vec::new();
     if in_segments.is_empty() {
@@ -548,6 +563,10 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
                         in_section.sh_size(endian).into() as usize,
                         in_section.sh_addralign(endian).into() as usize,
                     );
+                }
+                elf::SHT_GNU_ATTRIBUTES => {
+                    attributes_addr = in_section.sh_addr(endian).into();
+                    writer.reserve_gnu_attributes(gnu_attributes_size);
                 }
                 _ => {}
             }
@@ -781,6 +800,28 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
                     debug_assert_eq!(out_sections[i].offset, writer.len());
                     writer.write(in_section.data(endian, in_data)?);
                 }
+                elf::SHT_GNU_ATTRIBUTES => {
+                    writer.write_align_gnu_attributes();
+                    let (version, mut vsections, _link) = in_attrib.clone().unwrap();
+                    writer.write_gnu_attributes_version(version);
+                    println!(".gnu.attributes version {}", version);
+                    while let Some((section_length, vendor_name, mut tags)) = vsections.next()? {
+                        writer.write_gnu_attributes_subsection(
+                            section_length.get(endian),
+                            vendor_name,
+                        );
+                        println!(
+                            "Attrib section with length {}, and vendor {}",
+                            section_length.get(endian),
+                            std::str::from_utf8(vendor_name).unwrap(),
+                        );
+
+                        while let Some((tag, tag_data)) = tags.next()? {
+                            writer.write_gnu_attributes_tag(tag, tag_data);
+                            println!("Got tag {}", tag);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -941,6 +982,9 @@ fn copy_file<Elf: FileHeader<Endian = Endianness>>(
             }
             elf::SHT_GNU_VERNEED => {
                 writer.write_gnu_verneed_section_header(verneed_addr);
+            }
+            elf::SHT_GNU_ATTRIBUTES => {
+                writer.write_gnu_attributes_section_header(attributes_addr);
             }
             other => {
                 panic!("Unsupported section type {:x}", other);
